@@ -24,6 +24,7 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import io
 import os
 from pprint import pprint
 from typing import Optional
@@ -33,6 +34,7 @@ import requests
 import torch
 import tritonserver
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from PIL import Image
 from ray import serve
 
@@ -77,7 +79,15 @@ class BaseDeployment:
                 image_.save(filename)
 
 
-@serve.deployment(ray_actor_options={"num_gpus": 1})
+@serve.deployment(
+    ray_actor_options={"num_gpus": 1},
+    autoscaling_config={
+        "target_num_ongoing_requests_per_replica": 1,
+        "min_replicas": 1,
+        "initial_replicas": 1,
+        "max_replicas": 10,
+    },
+)
 @serve.ingress(app)
 class TritonDeployment:
     def __init__(self):
@@ -146,6 +156,12 @@ class TritonDeployment:
             image_ = Image.fromarray(generated_image)
             if filename:
                 image_.save(filename)
+            
+            # Stream back the image to the caller
+            buffer = io.BytesIO()
+            image_.save(buffer, 'JPEG')
+            buffer.seek(0)
+            return StreamingResponse(buffer, media_type="image/jpeg")
 
 
 def tritonserver_deployment(_args):

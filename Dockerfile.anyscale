@@ -1,0 +1,109 @@
+# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#  * Neither the name of NVIDIA CORPORATION nor the names of its
+#    contributors may be used to endorse or promote products derived
+#    from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+# OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver
+ARG BASE_IMAGE_TAG=24.01-py3
+
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as tritonserver-stable-diffusion
+
+# Start of Anyscale modifications
+RUN userdel --remove triton-server
+RUN apt-get clean && apt-get update -y \
+    && apt-get install -y sudo tzdata supervisor openssh-client openssh-server rsync zip unzip git nfs-common \
+    && useradd -ms /bin/bash -d /home/ray ray --uid 1000 --gid 100 \
+    && usermod -aG sudo ray \
+    && echo 'ray ALL=NOPASSWD: ALL' >> /etc/sudoers \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Switch to ray user
+USER ray
+ENV HOME=/home/ray
+
+RUN sudo apt-get update -y \
+    && sudo apt-get install -y python3-venv \
+    && sudo rm -rf /var/lib/apt/lists/* \
+    && sudo apt-get clean
+
+RUN python3 -m venv --system-site-packages /home/ray/virtualenv
+ENV PATH=/home/ray/virtualenv/bin:$PATH
+
+RUN mkdir -p /tmp/ray && mkdir -p /tmp/supervisord
+
+RUN pip install --no-cache-dir anyscale jupyterlab==3.6.1 'urllib3<1.27' 
+# End of Anyscale modifications
+
+RUN pip install --no-cache-dir --pre --upgrade --extra-index-url https://pypi.nvidia.com tensorrt
+
+RUN git clone https://github.com/NVIDIA/TensorRT.git -b release/9.2 --single-branch /tmp/TensorRT
+
+RUN pip install --no-cache-dir -r /tmp/TensorRT/demo/Diffusion/requirements.txt
+
+RUN pip install --no-cache-dir tritonclient[all]
+
+RUN mkdir -p /opt/tritonserver/backends/diffusion
+
+RUN cp -rf /tmp/TensorRT/demo/Diffusion /opt/tritonserver/backends/diffusion/
+
+COPY --chown=1000:100 ./Popular_Models_Guide/StableDiffusion/backend/diffusion/model.py /opt/tritonserver/backends/diffusion/model.py
+
+COPY --chown=1000:100 ./Popular_Models_Guide/StableDiffusion/diffusion-models /workspace/diffusion-models
+
+# Start of second Dockerfile
+RUN sudo apt-get update; sudo apt-get install -y gdb
+
+COPY --chown=1000:100 ./Triton_Inference_Server_Python_API/deps/requirements.txt /tmp/requirements.txt
+
+RUN pip install --no-cache-dir --timeout=2000 -r /tmp/requirements.txt
+
+# Finish pyright install
+
+RUN pyright --help
+
+COPY --chown=1000:100 ./Triton_Inference_Server_Python_API/deps/tritonserver-2.41.0.dev0-py3-none-any.whl /tmp/tritonserver-2.41.0.dev0-py3-none-any.whl
+
+RUN find /opt/tritonserver/python -maxdepth 1 -type f -name \
+    "tritonserver-*.whl" | xargs -I {} pip install --no-cache-dir --force-reinstall --upgrade {}[all]
+
+RUN pip show tritonserver 1>/dev/null || \
+    if [ $? != 0 ]; then \
+       pip --no-cache-dir install /tmp/tritonserver-2.41.0.dev0-py3-none-any.whl[all] ;\
+    fi
+
+RUN sudo ln -sf /bin/bash /bin/sh
+
+COPY --chown=1000:100 ./Triton_Inference_Server_Python_API /workspace
+RUN ln -s /workspace/.cache/huggingface /home/ray/.cache/huggingface
+COPY --chown=1000:100 ./Popular_Models_Guide/StableDiffusion/backend/diffusion /opt/tritonserver/backends/diffusion
+
+ARG RUN_TESTS=FALSE
+
+RUN if [[ "$RUN_TESTS" == "TRUE" ]] ; then cd /tmp && git clone -b r23.12-python-api https://github.com/triton-inference-server/core.git && cp -rf /tmp/core/python/test /workspace/deps/ ; fi
+
+RUN if [[ "$RUN_TESTS" == "TRUE" ]] ; then pytest /workspace/deps ; fi
+
+RUN mv /workspace/examples/rayserve/tritonserver_deployment.py /workspace/backend/diffusion/Diffusion
+RUN ln -s /workspace/backend/diffusion/Diffusion /workspace/backend/diffusion/Diffusion/Diffusion
